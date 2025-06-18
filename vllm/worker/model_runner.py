@@ -24,7 +24,7 @@ from vllm.attention.backends.abstract import AttentionState
 from vllm.attention.backends.utils import CommonAttentionState
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
-from vllm.distributed import broadcast_tensor_dict, get_pp_group
+from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.parallel_state import (get_tensor_model_parallel_rank,
                                              graph_capture)
@@ -1736,15 +1736,23 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         """
         model_input = self._prepare_model_input_tensors(
             seq_group_metadata_list, finished_requests_ids)
-        if get_pp_group().is_last_rank:
-            # Sampling metadata is only required for the final pp group
-            generators = self.get_generators(finished_requests_ids)
-            sampling_metadata = SamplingMetadata.prepare(
-                seq_group_metadata_list, model_input.seq_lens,
-                model_input.query_lens, self.device, self.pin_memory,
-                generators, self.sampling_metadata_cache)
-        else:
-            sampling_metadata = None
+        
+        # compatible for kv cache connector
+        generators = self.get_generators(finished_requests_ids)
+        sampling_metadata = SamplingMetadata.prepare(
+            seq_group_metadata_list, model_input.seq_lens,
+            model_input.query_lens, self.device, self.pin_memory,
+            generators, self.sampling_metadata_cache)
+        
+        # if get_pp_group().is_last_rank:
+        #     # Sampling metadata is only required for the final pp group
+        #     generators = self.get_generators(finished_requests_ids)
+        #     sampling_metadata = SamplingMetadata.prepare(
+        #         seq_group_metadata_list, model_input.seq_lens,
+        #         model_input.query_lens, self.device, self.pin_memory,
+        #         generators, self.sampling_metadata_cache)
+        # else:
+        #     sampling_metadata = None
         is_prompt = (seq_group_metadata_list[0].is_prompt
                      if seq_group_metadata_list else None)
         return dataclasses.replace(model_input,
@@ -1812,8 +1820,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # In KV cache database setting, it will change the model input so that
         # we can skip prefilling on tokens that successfully received KV caches
         # NOTE: The receive operation is blocking
+        
         bypass_model_exec = False
         if self.need_recv_kv(model_input, kv_caches):
+            # TODO(fengql123): load the intermediate_tensors for this rank
+            # pipeline parallelism only
+            
             hidden_or_intermediate_states, bypass_model_exec, model_input = \
                 get_kv_transfer_group().recv_kv_caches_and_hidden_states(
                     # model is used to know which layer the current worker
@@ -1821,7 +1833,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     # layers.
                     model_executable,
                     model_input,
-                    kv_caches=kv_caches
+                    kv_caches=kv_caches,
+                    cpu_group=get_tp_group().cpu_group
                 )
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
@@ -1839,6 +1852,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            # TODO(fengql123) add compute_kv_only argument (optional)
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
                 hidden_or_intermediate_states = model_executable(
@@ -1861,6 +1875,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # Sending KV cache in distributed KV cache transfer setting
         # NOTE: the send operation is non-blocking
         if self.need_send_kv(model_input, kv_caches):
+            # TODO(fengql123): if it isn't the first rank and pipeline parallelism is activated
+            # store the intermediate_tensors
+            if not get_pp_group().is_first_rank:
+                pass
+            
             get_kv_transfer_group().send_kv_caches_and_hidden_states(
                 # model_executable is used to know which layer the current
                 # worker is working on, so that we can send KV for only those
@@ -1869,7 +1888,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 model_input,
                 kv_caches,
                 hidden_or_intermediate_states,
+                cpu_group=get_tp_group().cpu_group
             )
+        
+        if intermediate_tensors is not None:
+            for k, v in intermediate_tensors.items():
+                logger.info(f"{k}: {v.shape}")
 
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
@@ -1971,12 +1995,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             1. current vLLM instance is KV cache consumer/decode vLLM instance
             2. this batch is not a profiling run
             3. this batch is a prefill run
+            
+        should also return another bool, which is compute_kv_only
 
         Args:
             model_input: input to the model executable
             kv_caches: vLLM's paged memory
         """
-
+        # TODO(fengql123): check whether it's a cake non-prefill chunk
+        # if True return False, True
+        # else compute_kv_only = False
+        
         if self.vllm_config.kv_transfer_config is None:
             return False
 

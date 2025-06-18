@@ -14,6 +14,7 @@ import torch.nn as nn
 from vllm.config import (ObservabilityConfig, VllmConfig,
                          set_current_vllm_config)
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -410,6 +411,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         intermediate_tensors = None
         orig_model_execute_time = 0.0
         if not get_pp_group().is_first_rank:
+            # TODO(fengql123) should receive intermediate tensors from here, depends on the request
+            # must receive everything, else just wait for computation
+            # must signal to send or not as well
+            
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
