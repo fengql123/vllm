@@ -126,3 +126,8 @@ KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector")
+
+KVConnectorFactory.register_connector(
+    "CakeConnector",
+    "vllm.distributed.kv_transfer.kv_connector.cake_connector",
+    "CakeConnector")

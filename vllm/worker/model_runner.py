@@ -1733,7 +1733,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         - input_tokens[num_prefill_tokens:] contains decode tokens.
 
         If cuda graph is required, this API automatically pads inputs.
-        """
+        """        
         model_input = self._prepare_model_input_tensors(
             seq_group_metadata_list, finished_requests_ids)
         
@@ -1755,10 +1755,15 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         #     sampling_metadata = None
         is_prompt = (seq_group_metadata_list[0].is_prompt
                      if seq_group_metadata_list else None)
-        return dataclasses.replace(model_input,
+        model_input = dataclasses.replace(model_input,
                                    sampling_metadata=sampling_metadata,
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
+        
+        # TODO(fengql123) preprocess the seq_group_metadata_list 
+        # fast forward if needed (for cake only)
+        get_kv_transfer_group().cake_preprocess_merge(model_input, seq_group_metadata_list)
+        return model_input
 
     @torch.inference_mode()
     def execute_model(
@@ -1871,7 +1876,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()
-
+            
         # Sending KV cache in distributed KV cache transfer setting
         # NOTE: the send operation is non-blocking
         if self.need_send_kv(model_input, kv_caches):
@@ -1891,9 +1896,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 cpu_group=get_tp_group().cpu_group
             )
         
-        if intermediate_tensors is not None:
-            for k, v in intermediate_tensors.items():
-                logger.info(f"{k}: {v.shape}")
+        # if intermediate_tensors is not None:
+        #     for k, v in intermediate_tensors.items():
+        #         logger.info(f"{k}: {v.shape}")
 
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
@@ -1968,6 +1973,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                         assert len(sequence_group_output.samples) == 1
                         sequence_group_output.samples[
                             0].output_embed = token_embed
+                        
+        torch.cuda.default_stream().synchronize()
 
         if not self.is_driver_worker:
             return []
